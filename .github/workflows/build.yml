@@ -1,0 +1,117 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: 🐍 Setup Python 3.8
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.8'
+
+      - name: 📦 Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    needs: install
+    outputs:
+      latest_sha: ${{ steps.export-sha.outputs.sha }}
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: 🔐 Configure AWS Credentials
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set region ${{ vars.AWS_REGION }}
+
+      - name: 🧰 Install AWS CLI & kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x ./kubectl
+          sudo mv ./kubectl /usr/local/bin/kubectl
+          pip install --upgrade awscli
+          aws --version
+          kubectl version --client
+
+      - name: 🔐 Authenticate to AWS ECR
+        run: |
+          aws ecr get-login-password --region ${{ vars.AWS_REGION }} | \
+          docker login --username AWS --password-stdin ${{ vars.IMAGE_REGISTRY }}
+
+      - name: 🏗️ Build Docker Image
+        run: |
+          LATEST_SHA=$(git rev-parse HEAD)
+          echo "LATEST_SHA=$LATEST_SHA" >> $GITHUB_ENV
+          docker build -t ${{ vars.IMAGE_REGISTRY }}:$LATEST_SHA .
+          docker tag ${{ vars.IMAGE_REGISTRY }}:$LATEST_SHA ${{ vars.IMAGE_REGISTRY }}:latest
+
+#      - name: 🏗️ Cortex CLI scan image
+#        run: |
+#          crtx_resp=$(curl -s curl -s "https://api-cwp-ci-july.xdr-qa2-uat.us.paloaltonetworks.com/public_api/v1/unified-cli/releases/download-link?os=linux&architecture=amd64" -H "x-xdr-auth-id: 828" -H "Authorization: 5pBHsCQ1vSkBXqissF3W04s8aGLb33RywbCySeo77g8FD1iUTQBWXiNxvnHPu5oF1SlgLOVU4pLkbonriY4QKYsd3NBMvB80NaKP6BqX3Gx6IFXmTE9z8MvrFbxw7Szy") && crtx_url=$(echo $crtx_resp | jq -r ".signed_url") && crtx_file=$(echo $crtx_resp | jq -r ".file_name") && curl -o $crtx_file $crtx_url
+#          chmod +x ./cortexcli
+#          sudo ./cortexcli --api-base-url https://api-cwp-ci-july.xdr-qa2-uat.us.paloaltonetworks.com --api-key ${{ secrets.CORTEX_API_KEY }} --api-key-id 828 --log-level debug image scan ${{ vars.IMAGE_REGISTRY }}:$LATEST_SHA
+
+      - name: 🚀 Push Docker Image to AWS ECR
+        run: |
+          docker push ${{ vars.IMAGE_REGISTRY }}:$LATEST_SHA
+          docker push ${{ vars.IMAGE_REGISTRY }}:latest
+
+      - name: 📤 Set Output for Latest SHA
+        id: export-sha
+        run: echo "sha=$LATEST_SHA" >> $GITHUB_OUTPUT
+
+  deploy-to-eks:
+    runs-on: ubuntu-latest
+    needs: build-and-push-image
+    env:
+      LATEST_SHA: ${{ needs.build-and-push-image.outputs.latest_sha }}
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: 🔐 Configure AWS Credentials
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set region ${{ vars.AWS_REGION }}
+
+      - name: 🔄 Update Kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name ${{ vars.EKS_NAME }} --region ${{ vars.AWS_REGION }}
+
+      - name: 🔍 Check if Kubernetes Deployment Exists
+        id: check-deployment
+        run: |
+          DEPLOYMENT_NAME=${{ vars.DEPLOYMENT_NAME }}
+          DEPLOYMENT_EXISTS=$(kubectl get deployment $DEPLOYMENT_NAME -n default --ignore-not-found)
+          echo "deployment_exists=$([ -z "$DEPLOYMENT_EXISTS" ] && echo "false" || echo "true")" >> $GITHUB_OUTPUT
+
+      - name: 🆕 Create New Deployment (if not exists)
+        if: steps.check-deployment.outputs.deployment_exists == 'false'
+        run: |
+          kubectl create deployment ${{ vars.DEPLOYMENT_NAME }} \
+            --image=${{ vars.IMAGE_REGISTRY }}:$LATEST_SHA -n default
+
+      - name: 🔄 Update Deployment Image (if exists)
+        if: steps.check-deployment.outputs.deployment_exists == 'true'
+        run: |
+          DEPLOYMENT_NAME=${{ vars.DEPLOYMENT_NAME }}
+          CONTAINER_NAME=$(kubectl get deployment $DEPLOYMENT_NAME -n default -o jsonpath='{.spec.template.spec.containers[0].name}')
+          echo "Updating container $CONTAINER_NAME in $DEPLOYMENT_NAME to use image ${{ vars.IMAGE_REGISTRY }}:$LATEST_SHA"
+          kubectl set image deployment/$DEPLOYMENT_NAME $CONTAINER_NAME=${{ vars.IMAGE_REGISTRY }}:$LATEST_SHA -n default
